@@ -24,6 +24,8 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include <iostream>
 using namespace llvm;
 
@@ -95,8 +97,41 @@ namespace {
       return true;
     }
   };
+
+  // New Pass Manager
+  struct LedgerROPI_NewPM : PassInfoMixin<LedgerROPI_NewPM> {
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+      processModule(M);
+      return PreservedAnalyses::all();
+    }
+  };
+
 }
 
 char LedgerROPI::ID = 0;
 static RegisterPass<LedgerROPI> X("ledger-ropi", "Ledger-specific read-only position-independent pass");
 
+/* New PM Registration */
+llvm::PassPluginLibraryInfo getLedgerROPI_NewPMPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "ledger-ropi", LLVM_VERSION_STRING,
+    [](PassBuilder &PB) {
+      PB.registerPipelineParsingCallback(
+                                         [](StringRef Name, llvm::ModulePassManager &PM,
+                                            ArrayRef<llvm::PassBuilder::PipelineElement>) {
+                                           if (Name == "ledger-ropi") {
+                                             PM.addPass(LedgerROPI_NewPM());
+                                             return true;
+                                           }
+                                           return false;
+                                         });
+      PB.registerPipelineStartEPCallback(
+                                           [](llvm::ModulePassManager &PM, OptimizationLevel Level) {
+                                             PM.addPass(LedgerROPI_NewPM());
+                                           });
+    }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return getLedgerROPI_NewPMPluginInfo();
+}
