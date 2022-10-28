@@ -124,7 +124,7 @@ llvm::PassPluginLibraryInfo getLedgerROPI_NewPMPluginInfo() {
                                            }
                                            return false;
                                          });
-      PB.registerPipelineStartEPCallback(
+      PB.registerOptimizerLastEPCallback(
                                            [](llvm::ModulePassManager &PM, OptimizationLevel Level) {
                                              PM.addPass(LedgerROPI_NewPM());
                                            });
