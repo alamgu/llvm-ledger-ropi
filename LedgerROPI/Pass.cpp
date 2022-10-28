@@ -16,6 +16,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -23,6 +24,8 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include <iostream>
 using namespace llvm;
 
@@ -43,54 +46,92 @@ namespace {
     return builder.CreatePointerCast(fixed_ptr, ptr->getType(), "fixed_ptr");
   }
 
+  void processModule(Module &M) {
+    M.getOrInsertGlobal("ro_offset",Type::getInt32Ty(M.getContext()));
+    M.getOrInsertGlobal("_nvram",Type::getInt32Ty(M.getContext()));
+    for (auto &F: M.getFunctionList())
+      for ( auto I = inst_begin(F), E = inst_end(F); I != E; ++I ) {
+        Instruction *inst = &*I;
+        switch( inst->getOpcode() ) {
+        case Instruction::Load:
+          {
+            auto *L = dyn_cast<LoadInst>(inst);
+            auto *P = L->getPointerOperand();
+            if(isa<AllocaInst>(P)) break;
+            auto *newaddr = fixPointer(L, L->getPointerOperand(), F, M);
+            L->setOperand(L->getPointerOperandIndex(), newaddr);
+            break;
+          }
+        case Instruction::Invoke:
+          {
+            break;
+          }
+        case Instruction::Call:
+          {
+            auto *C = dyn_cast<CallInst>(inst);
+            auto *targ = C->getCalledOperand();
+            auto *targF = dyn_cast<Function>(targ);
+            // Don't change normal function references (handled by the pic code
+            // already) or inline assembly.  Ignoring intrinsic functions and
+            // inline assembly is required here - they don't have pointers - but
+            // ignoring direct function references is not and is here as an
+            // approximation of "is an indirect function reference".
+            if(targ && ! targF && ! isa<InlineAsm>(targ)) {
+              auto *newaddr = fixPointer(C, targ, F, M);
+              C->setCalledOperand(newaddr);
+            }
+            break;
+          }
+        default: break;
+        }
+      }
+  }
+
+  // Legacy
   struct LedgerROPI : public ModulePass {
     static char ID;
     LedgerROPI() : ModulePass(ID) {}
 
     bool runOnModule(Module &M) override {
-      M.getOrInsertGlobal("ro_offset",Type::getInt32Ty(M.getContext()));
-      M.getOrInsertGlobal("_nvram",Type::getInt32Ty(M.getContext()));
-      for (auto &F: M.getFunctionList())
-        for ( auto I = inst_begin(F), E = inst_end(F); I != E; ++I ) {
-          Instruction *inst = &*I;
-          switch( inst->getOpcode() ) {
-            case Instruction::Load:
-              {
-                auto *L = dyn_cast<LoadInst>(inst);
-                auto *P = L->getPointerOperand();
-                if(isa<AllocaInst>(P)) break;
-                auto *newaddr = fixPointer(L, L->getPointerOperand(), F, M);
-                L->setOperand(L->getPointerOperandIndex(), newaddr);
-                break;
-              }
-            case Instruction::Invoke:
-              {
-                break;
-              }
-            case Instruction::Call:
-              {
-                auto *C = dyn_cast<CallInst>(inst);
-                auto *targ = C->getCalledOperand();
-                auto *targF = dyn_cast<Function>(targ);
-                // Don't change normal function references (handled by the pic code
-                // already) or inline assembly.  Ignoring intrinsic functions and
-                // inline assembly is required here - they don't have pointers - but
-                // ignoring direct function references is not and is here as an
-                // approximation of "is an indirect function reference".
-                if(targ && ! targF && ! isa<InlineAsm>(targ)) {
-                  auto *newaddr = fixPointer(C, targ, F, M);
-                  C->setCalledOperand(newaddr);
-                }
-                break;
-              }
-            default: break;
-          }
-        }
+      processModule(M);
       return true;
     }
   };
+
+  // New Pass Manager
+  struct LedgerROPI_NewPM : PassInfoMixin<LedgerROPI_NewPM> {
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+      processModule(M);
+      return PreservedAnalyses::all();
+    }
+  };
+
 }
 
 char LedgerROPI::ID = 0;
 static RegisterPass<LedgerROPI> X("ledger-ropi", "Ledger-specific read-only position-independent pass");
 
+/* New PM Registration */
+llvm::PassPluginLibraryInfo getLedgerROPI_NewPMPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "ledger-ropi", LLVM_VERSION_STRING,
+    [](PassBuilder &PB) {
+      PB.registerPipelineParsingCallback(
+                                         [](StringRef Name, llvm::ModulePassManager &PM,
+                                            ArrayRef<llvm::PassBuilder::PipelineElement>) {
+                                           if (Name == "ledger-ropi") {
+                                             PM.addPass(LedgerROPI_NewPM());
+                                             return true;
+                                           }
+                                           return false;
+                                         });
+      PB.registerOptimizerLastEPCallback(
+                                           [](llvm::ModulePassManager &PM, OptimizationLevel Level) {
+                                             PM.addPass(LedgerROPI_NewPM());
+                                           });
+    }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return getLedgerROPI_NewPMPluginInfo();
+}
